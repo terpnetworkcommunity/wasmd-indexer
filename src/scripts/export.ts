@@ -1,7 +1,7 @@
 import * as fs from 'fs'
 import readline from 'readline'
-import { Worker } from 'worker_threads'
 
+import * as Sentry from '@sentry/node'
 import axios from 'axios'
 import { Command } from 'commander'
 import { Sequelize } from 'sequelize'
@@ -20,7 +20,6 @@ import { setupMeilisearch, updateIndexesForContracts } from '@/ms'
 
 import { objectMatchesStructure } from './utils'
 
-const BULK_INSERT_SIZE = 500
 const LOADER_MAP = ['—', '\\', '|', '/']
 
 // Parse arguments.
@@ -30,9 +29,15 @@ program.option(
   'path to config file, falling back to config.json'
 )
 program.option(
-  '-b, --block <height>',
+  '-i, --initial <block height>',
   'block height to start exporting from, falling back to after the last exported block',
   (value) => parseInt(value, 10)
+)
+program.option(
+  '-b, --batch <size>',
+  'batch size',
+  (value) => parseInt(value, 10),
+  1000
 )
 program.option(
   // Adds inverted `update` boolean to the options object.
@@ -49,6 +54,13 @@ const options = program.opts()
 
 // Load config with config option.
 const config = loadConfig(options.config)
+
+// Add Sentry error reporting.
+if (config.sentryDsn) {
+  Sentry.init({
+    dsn: config.sentryDsn,
+  })
+}
 
 // Read state.
 let reading = false
@@ -90,7 +102,7 @@ const main = async () => {
   const initialState = await updateState()
 
   const initialBlock =
-    (options.block as number | undefined) ??
+    (options.initial as number | undefined) ??
     // Start at the next block after the last exported block if no command line
     // argument passed for `block`.
     (initialState.lastBlockHeightExported ?? 0) + 1
@@ -280,7 +292,7 @@ const main = async () => {
           // block, flush the previous events to the DB. This ensures we batch
           // all events from the same block together.
           if (
-            pendingIndexerEvents.length >= BULK_INSERT_SIZE &&
+            pendingIndexerEvents.length >= options.batch &&
             event.blockHeight > lastBlockHeightSeen
           ) {
             await processPendingEvents()
@@ -314,6 +326,15 @@ const main = async () => {
           }
         }
       } catch (err) {
+        Sentry.captureException(err, {
+          tags: {
+            script: 'export',
+          },
+          extra: {
+            bytesRead,
+            latestBlockHeight,
+          },
+        })
         reject(err)
       }
     }
@@ -400,17 +421,40 @@ const exporter = async (
     ...new Set(parsedEvents.map((event) => event.contractAddress)),
   ]
 
-  // Ensure contract exists before creating events. `address` is unique.
-  await Contract.bulkCreate(
-    uniqueContracts.map((address) => ({
-      address,
-      codeId: parsedEvents.find((event) => event.contractAddress === address)!
-        .codeId,
-    })),
-    {
-      ignoreDuplicates: true,
+  // Try to create contracts up to 3 times. This has previously failed due to a
+  // deadlock.
+  let contractCreationAttempts = 3
+  while (contractCreationAttempts > 0) {
+    try {
+      // Ensure contract exists before creating events. `address` is unique.
+      await Contract.bulkCreate(
+        uniqueContracts.map((address) => ({
+          address,
+          codeId: parsedEvents.find(
+            (event) => event.contractAddress === address
+          )!.codeId,
+        })),
+        // When contract is migrated, codeId changes.
+        {
+          updateOnDuplicate: ['codeId'],
+        }
+      )
+
+      // Break on success.
+      break
+    } catch (err) {
+      console.error(err)
+      Sentry.captureException(err, {
+        tags: {
+          script: 'export',
+        },
+        extra: {
+          uniqueContracts,
+        },
+      })
+      contractCreationAttempts--
     }
-  )
+  }
 
   // Get updated contracts.
   const contracts = await Contract.findAll({
